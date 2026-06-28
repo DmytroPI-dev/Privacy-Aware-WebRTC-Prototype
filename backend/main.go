@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"messenger-backend/router"
+	"os"
 )
 
 func main() {
@@ -11,7 +12,16 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := r.Run(":8080"); err != nil {
+	addr := os.Getenv("BACKEND_ADDR")
+	if addr == "" {
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080"
+		}
+		addr = "127.0.0.1:" + port
+	}
+
+	if err := r.Run(addr); err != nil {
 		log.Fatal(err)
 	}
 }
