@@ -22,14 +22,13 @@ REMOTE_TMP="${REMOTE_TMP:-/root/deploy-tmp}"
 REMOTE_BACKEND_PATH="${REMOTE_BACKEND_PATH:-/usr/local/bin/messenger-backend}"
 REMOTE_FRONTEND_PATH="${REMOTE_FRONTEND_PATH:-/var/www/weather}"
 
-export VITE_TURN_SERVER="${VITE_TURN_SERVER}"
-export VITE_TURN_USERNAME="${VITE_TURN_USERNAME}"
-export VITE_TURN_PASSWORD="${VITE_TURN_PASSWORD}"
-export VITE_TURN_FORCE_TLS_443="${VITE_TURN_FORCE_TLS_443:-}"
-export VITE_TURN_URLS="${VITE_TURN_URLS:-}"
 export CORS_ORIGIN="${CORS_ORIGIN}"
 export BULLETIN_STORE_PATH="${BULLETIN_STORE_PATH:-/var/lib/messenger-backend/bulletins.json}"
 export BULLETIN_TTL_MINUTES="${BULLETIN_TTL_MINUTES:-4320}"
+export TURN_SHARED_SECRET="${TURN_SHARED_SECRET}"
+export TURN_REALM="${TURN_REALM}"
+export TURN_TTL_SECONDS="${TURN_TTL_SECONDS:-600}"
+export TURN_URLS="${TURN_URLS:-}"
 
 echo "Starting local build and deploy for black-sea.org..."
 
@@ -62,7 +61,7 @@ scp -i "$SSH_KEY" -r ./dist-temp/. "$REMOTE_USER@$REMOTE_HOST:$REMOTE_TMP/"
 # --- 5. REMOTE PRODUCTION SWAP ---
 echo "Installing artifacts and restarting services..."
 ssh -i "$SSH_KEY" "$REMOTE_USER@$REMOTE_HOST" \
-    "REMOTE_TMP='$REMOTE_TMP' REMOTE_BACKEND_PATH='$REMOTE_BACKEND_PATH' REMOTE_FRONTEND_PATH='$REMOTE_FRONTEND_PATH' CORS_ORIGIN='$CORS_ORIGIN' BULLETIN_STORE_PATH='$BULLETIN_STORE_PATH' BULLETIN_TTL_MINUTES='$BULLETIN_TTL_MINUTES' bash -s" <<'EOF'
+    "REMOTE_TMP='$REMOTE_TMP' REMOTE_BACKEND_PATH='$REMOTE_BACKEND_PATH' REMOTE_FRONTEND_PATH='$REMOTE_FRONTEND_PATH' CORS_ORIGIN='$CORS_ORIGIN' BULLETIN_STORE_PATH='$BULLETIN_STORE_PATH' BULLETIN_TTL_MINUTES='$BULLETIN_TTL_MINUTES' TURN_SHARED_SECRET='$TURN_SHARED_SECRET' TURN_REALM='$TURN_REALM' TURN_TTL_SECONDS='$TURN_TTL_SECONDS' TURN_URLS='$TURN_URLS' bash -s" <<'EOF'
 set -euo pipefail
 
 systemctl stop messenger-backend || true
@@ -73,6 +72,8 @@ printf '[Service]\nEnvironment="CORS_ORIGIN=%s"\n' "$CORS_ORIGIN" \
   > /etc/systemd/system/messenger-backend.service.d/cors.conf
 printf '[Service]\nEnvironment="BULLETIN_STORE_PATH=%s"\nEnvironment="BULLETIN_TTL_MINUTES=%s"\n' "$BULLETIN_STORE_PATH" "$BULLETIN_TTL_MINUTES" \
   > /etc/systemd/system/messenger-backend.service.d/bulletin.conf
+printf '[Service]\nEnvironment="TURN_SHARED_SECRET=%s"\nEnvironment="TURN_REALM=%s"\nEnvironment="TURN_TTL_SECONDS=%s"\nEnvironment="TURN_URLS=%s"\n' "$TURN_SHARED_SECRET" "$TURN_REALM" "$TURN_TTL_SECONDS" "$TURN_URLS" \
+  > /etc/systemd/system/messenger-backend.service.d/turn.conf
 systemctl daemon-reload
 
 install -m 0755 "$REMOTE_TMP/messenger-backend" "$REMOTE_BACKEND_PATH"

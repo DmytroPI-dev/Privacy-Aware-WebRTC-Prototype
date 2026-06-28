@@ -13,8 +13,7 @@ Complete step-by-step guide for deploying the secure messenger on a VPS that has
 | App domain | `<YOUR_APP_DOMAIN>` |
 | TURN domain | `<YOUR_TURN_DOMAIN>` |
 | SSH key | `~/.ssh/your-key` |
-| TURN user | `<YOUR_TURN_USERNAME>` |
-| TURN password | `<YOUR_TURN_PASSWORD>` |
+| TURN shared secret | output of `openssl rand -hex 32` |
 
 Both DNS A records must point to the VPS IP before starting. Certbot needs HTTP-01 validation on port 80.
 
@@ -263,8 +262,8 @@ external-ip=<YOUR_VPS_IP>
 cert=/etc/letsencrypt/live/<YOUR_TURN_DOMAIN>/fullchain.pem
 pkey=/etc/letsencrypt/live/<YOUR_TURN_DOMAIN>/privkey.pem
 
-lt-cred-mech
-user=<YOUR_TURN_USERNAME>:your-password-here
+use-auth-secret
+static-auth-secret=<YOUR_TURN_SHARED_SECRET>
 
 min-port=49152
 max-port=65535
@@ -474,7 +473,7 @@ bash local-deploy.sh
 
 `local-deploy.sh` will:
 1. Cross-compile the Go backend for Linux AMD64
-2. Build the Vite/React frontend with TURN credentials injected as env vars
+2. Build the Vite/React frontend without TURN secrets
 3. Upload both artifacts to the VPS via SCP
 4. Stop the backend, swap the binaries/files, start the backend, reload nginx
 5. Verify the backend health endpoint
@@ -499,39 +498,26 @@ If you deploy with `local-deploy.sh`, use the configured `REMOTE_FRONTEND_PATH` 
 
 Both deployment paths preserve the existing `media/` directory on the server, so manually uploaded video assets are not removed by later deploys.
 
-### TURN credentials in the frontend
+### TURN credentials
 
-The frontend reads these Vite env vars at build time:
+The frontend no longer receives static TURN credentials at build time. It calls
+`/api/turn-credentials`, and the backend signs short-lived credentials with the
+shared secret configured in coturn.
 
-| Variable | Default in `local-deploy.sh` |
+Set these values in the local `.env` used by `local-deploy.sh`:
+
+| Variable | Value |
 |---|---|
-| `VITE_TURN_SERVER` | `<YOUR_TURN_DOMAIN>` |
-| `VITE_TURN_USERNAME` | `<YOUR_TURN_USERNAME>` |
-| `VITE_TURN_PASSWORD` | `<YOUR_TURN_PASSWORD>` |
-| `VITE_TURN_FORCE_TLS_443` | unset / `false` |
-| `VITE_TURN_URLS` | unset |
+| `TURN_SHARED_SECRET` | same value as `static-auth-secret` in `/etc/turnserver.conf` |
+| `TURN_REALM` | `<YOUR_TURN_DOMAIN>` |
+| `TURN_TTL_SECONDS` | `600` |
+| `TURN_URLS` | optional comma-separated TURN URLs |
 
-Override before running the script if needed:
-```bash
-export VITE_TURN_SERVER=turn.example.com
-export VITE_TURN_USERNAME=myuser
-export VITE_TURN_PASSWORD=mypassword
-bash local-deploy.sh
-```
-
-For aggressive networks that block UDP and most non-443 egress, rebuild the frontend with only TURN over TLS on 443:
+For aggressive networks that block UDP and most non-443 egress, leave
+`TURN_URLS` empty or set it explicitly to:
 
 ```bash
-export VITE_TURN_FORCE_TLS_443=true
-unset VITE_TURN_URLS
-bash local-deploy.sh
-```
-
-If you need an explicit custom order or a single pinned endpoint, set `VITE_TURN_URLS` as a comma-separated list instead. Example:
-
-```bash
-export VITE_TURN_URLS='turns:turn.example.com:443?transport=tcp'
-bash local-deploy.sh
+TURN_URLS='turns:turn.example.com:443?transport=tcp'
 ```
 
 ---
@@ -681,4 +667,5 @@ nginx must be running and occupying port 80 with the `/.well-known/acme-challeng
 
 ### TURN credentials wrong / 401 from coturn
 
-Verify the `user=` line in `/etc/turnserver.conf` matches `VITE_TURN_USERNAME:VITE_TURN_PASSWORD` used at frontend build time.
+Verify `/etc/turnserver.conf` uses `use-auth-secret`, and that
+`static-auth-secret` exactly matches the backend `TURN_SHARED_SECRET`.

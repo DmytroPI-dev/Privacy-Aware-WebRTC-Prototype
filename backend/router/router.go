@@ -69,6 +69,7 @@ func SetupRouter() (*gin.Engine, error) {
 	go bulletinStore.CleanupExpired()
 	router.GET("/health", func(c *gin.Context) { c.JSON(200, gin.H{"status": "ok"}) })
 	router.GET("/api/i18n/:language", handlePublicTranslation)
+	router.GET("/api/turn-credentials", handleTurnCredentials)
 	router.GET("/api/rooms/:roomId/status", handleRoomStatus)
 	router.POST("/api/bulletins/store", handleBulletinStore)
 	router.POST("/api/bulletins/read-once", handleBulletinReadOnce)

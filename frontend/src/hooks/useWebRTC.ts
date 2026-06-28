@@ -14,6 +14,13 @@ interface UseWebRTCReturn {
   remoteFingerprint: string | null;
 }
 
+interface TurnCredentialsResponse {
+  urls: string[];
+  username: string;
+  credential: string;
+  ttlSeconds?: number;
+}
+
 function resolveCallMode(mode: unknown): WebRTCCallMode {
   return mode === "video" ? "video" : "audio";
 }
@@ -147,26 +154,42 @@ async function logSelectedCandidatePair(
   }
 }
 
-function resolveTurnUrls(turnServer: string): string[] {
-  const configuredUrls = import.meta.env.VITE_TURN_URLS
-    ?.split(",")
-    .map((value: string) => value.trim())
-    .filter(Boolean);
-
-  if (configuredUrls && configuredUrls.length > 0) {
-    return configuredUrls;
+function isTurnCredentialsResponse(value: unknown): value is TurnCredentialsResponse {
+  if (!value || typeof value !== "object") {
+    return false;
   }
 
-  if (import.meta.env.VITE_TURN_FORCE_TLS_443 === "true") {
-    return [`turns:${turnServer}:443?transport=tcp`];
+  const candidate = value as Partial<TurnCredentialsResponse>;
+  return (
+    Array.isArray(candidate.urls) &&
+    candidate.urls.length > 0 &&
+    candidate.urls.every((url) => typeof url === "string" && url.trim() !== "") &&
+    typeof candidate.username === "string" &&
+    candidate.username.trim() !== "" &&
+    typeof candidate.credential === "string" &&
+    candidate.credential.trim() !== ""
+  );
+}
+
+async function fetchTurnIceServer(): Promise<RTCIceServer> {
+  const response = await fetch("/api/turn-credentials", {
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    throw new Error("turn_credentials_unavailable");
   }
 
-  return [
-    `turns:${turnServer}:443?transport=tcp`,
-    `turns:${turnServer}:5349?transport=tcp`,
-    `turn:${turnServer}:3478?transport=tcp`,
-    `turn:${turnServer}:3478?transport=udp`,
-  ];
+  const payload: unknown = await response.json();
+  if (!isTurnCredentialsResponse(payload)) {
+    throw new Error("turn_credentials_invalid");
+  }
+
+  return {
+    urls: payload.urls,
+    username: payload.username,
+    credential: payload.credential,
+  };
 }
 
 export function useWebRTC(
@@ -192,6 +215,7 @@ export function useWebRTC(
   const [remoteFingerprint, setRemoteFingerprint] = useState<string | null>(null);
   const [connectionState, setConnectionState] =
     useState<RTCPeerConnectionState>("new");
+  const [peerConnectionReadyVersion, setPeerConnectionReadyVersion] = useState(0);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
 
@@ -290,164 +314,209 @@ export function useWebRTC(
   useEffect(() => {
     setLocalFingerprint(null);
     setRemoteFingerprint(null);
+    setConnectionState("new");
+    peerConnectionRef.current = null;
 
-    const turnServer = import.meta.env.VITE_TURN_SERVER;
-    const turnUrls = resolveTurnUrls(turnServer);
+    let isDisposed = false;
+    let peerConnection: RTCPeerConnection | null = null;
     const log = logRef.current;
 
-    log("creating peer connection", {
-      mode,
-      turnServer,
-      turnUrls,
-      iceTransportPolicy: "relay",
-    });
+    const setupPeerConnection = async () => {
+      try {
+        const turnIceServer = await fetchTurnIceServer();
+        if (isDisposed) {
+          return;
+        }
 
-    const peerConnection = new RTCPeerConnection({
-      iceServers: [
-        {
-          urls: turnUrls,
-          username: import.meta.env.VITE_TURN_USERNAME,
-          credential: import.meta.env.VITE_TURN_PASSWORD,
-        },
-      ],
-      iceTransportPolicy: "relay",
-    });
-
-    peerConnectionRef.current = peerConnection;
-
-    peerConnection.onicecandidate = (event) => {
-      if (event.candidate) {
-        log("local ICE candidate", summarizeIceCandidate(event.candidate));
-        sendMessage({
-          type: "signal",
-          roomId: roomId,
-          data: { type: "ice-candidate", candidate: event.candidate },
+        log("creating peer connection", {
+          mode,
+          turnUrls: turnIceServer.urls,
+          iceTransportPolicy: "relay",
         });
-      } else {
-        log("local ICE gathering completed");
-      }
-    };
 
-    peerConnection.onicecandidateerror = (event) => {
-      log("ICE candidate error", {
-        address: event.address,
-        port: event.port,
-        url: event.url,
-        errorCode: event.errorCode,
-        errorText: event.errorText,
-      });
-    };
+        peerConnection = new RTCPeerConnection({
+          iceServers: [turnIceServer],
+          iceTransportPolicy: "relay",
+        });
 
-    peerConnection.oniceconnectionstatechange = () => {
-      log("ice connection state", {
-        iceConnectionState: peerConnection.iceConnectionState,
-        connectionState: peerConnection.connectionState,
-      });
+        peerConnectionRef.current = peerConnection;
 
-      if (
-        peerConnection.iceConnectionState === "connected" ||
-        peerConnection.iceConnectionState === "completed" ||
-        peerConnection.iceConnectionState === "failed"
-      ) {
-        void logSelectedCandidatePair(
-          peerConnection,
-          log,
-          `ice:${peerConnection.iceConnectionState}`,
-        );
-      }
-    };
-
-    peerConnection.onicegatheringstatechange = () => {
-      log("ice gathering state", {
-        iceGatheringState: peerConnection.iceGatheringState,
-      });
-    };
-
-    peerConnection.onsignalingstatechange = () => {
-      log("signaling state", {
-        signalingState: peerConnection.signalingState,
-      });
-    };
-
-    peerConnection.onnegotiationneeded = () => {
-      log("negotiation needed", {
-        signalingState: peerConnection.signalingState,
-      });
-    };
-
-    peerConnection.ontrack = (event) => {
-      log("remote track received", {
-        streams: event.streams.map((stream) => ({
-          id: stream.id,
-          trackCount: stream.getTracks().length,
-        })),
-        track: {
-          id: event.track.id,
-          kind: event.track.kind,
-          enabled: event.track.enabled,
-          muted: event.track.muted,
-          readyState: event.track.readyState,
-        },
-      });
-      setRemoteStream(event.streams[0]);
-    };
-
-    peerConnection.onconnectionstatechange = () => {
-      setConnectionState(peerConnection.connectionState);
-      log("peer connection state", {
-        connectionState: peerConnection.connectionState,
-        iceConnectionState: peerConnection.iceConnectionState,
-        iceGatheringState: peerConnection.iceGatheringState,
-        signalingState: peerConnection.signalingState,
-      });
-
-      if (
-        peerConnection.connectionState === "connected" ||
-        peerConnection.connectionState === "disconnected" ||
-        peerConnection.connectionState === "failed"
-      ) {
-        void logSelectedCandidatePair(
-          peerConnection,
-          log,
-          `connection:${peerConnection.connectionState}`,
-        );
-      }
-
-      if (peerConnection.connectionState === "connected") {
-        clearDisconnectTimer();
-        isRestartingIceRef.current = false;
-        iceRestartAttemptsRef.current = 0;
-      }
-
-      if (peerConnection.connectionState === "disconnected") {
-        clearDisconnectTimer();
-        disconnectTimerRef.current = window.setTimeout(() => {
-          if (peerConnection.connectionState === "disconnected") {
-            void restartIce("disconnect timeout");
+        peerConnection.onicecandidate = (event) => {
+          if (!peerConnection) {
+            return;
           }
-          disconnectTimerRef.current = null;
-        }, 5000);
-      }
 
-      if (peerConnection.connectionState === "failed") {
-        clearDisconnectTimer();
-        void restartIce("connection failed");
-      }
+          if (event.candidate) {
+            log("local ICE candidate", summarizeIceCandidate(event.candidate));
+            sendMessage({
+              type: "signal",
+              roomId: roomId,
+              data: { type: "ice-candidate", candidate: event.candidate },
+            });
+          } else {
+            log("local ICE gathering completed");
+          }
+        };
 
-      if (peerConnection.connectionState === "closed") {
-        clearDisconnectTimer();
+        peerConnection.onicecandidateerror = (event) => {
+          log("ICE candidate error", {
+            address: event.address,
+            port: event.port,
+            url: event.url,
+            errorCode: event.errorCode,
+            errorText: event.errorText,
+          });
+        };
+
+        peerConnection.oniceconnectionstatechange = () => {
+          if (!peerConnection) {
+            return;
+          }
+
+          log("ice connection state", {
+            iceConnectionState: peerConnection.iceConnectionState,
+            connectionState: peerConnection.connectionState,
+          });
+
+          if (
+            peerConnection.iceConnectionState === "connected" ||
+            peerConnection.iceConnectionState === "completed" ||
+            peerConnection.iceConnectionState === "failed"
+          ) {
+            void logSelectedCandidatePair(
+              peerConnection,
+              log,
+              `ice:${peerConnection.iceConnectionState}`,
+            );
+          }
+        };
+
+        peerConnection.onicegatheringstatechange = () => {
+          if (!peerConnection) {
+            return;
+          }
+
+          log("ice gathering state", {
+            iceGatheringState: peerConnection.iceGatheringState,
+          });
+        };
+
+        peerConnection.onsignalingstatechange = () => {
+          if (!peerConnection) {
+            return;
+          }
+
+          log("signaling state", {
+            signalingState: peerConnection.signalingState,
+          });
+        };
+
+        peerConnection.onnegotiationneeded = () => {
+          if (!peerConnection) {
+            return;
+          }
+
+          log("negotiation needed", {
+            signalingState: peerConnection.signalingState,
+          });
+        };
+
+        peerConnection.ontrack = (event) => {
+          log("remote track received", {
+            streams: event.streams.map((stream) => ({
+              id: stream.id,
+              trackCount: stream.getTracks().length,
+            })),
+            track: {
+              id: event.track.id,
+              kind: event.track.kind,
+              enabled: event.track.enabled,
+              muted: event.track.muted,
+              readyState: event.track.readyState,
+            },
+          });
+          setRemoteStream(event.streams[0]);
+        };
+
+        peerConnection.onconnectionstatechange = () => {
+          if (!peerConnection) {
+            return;
+          }
+
+          setConnectionState(peerConnection.connectionState);
+          log("peer connection state", {
+            connectionState: peerConnection.connectionState,
+            iceConnectionState: peerConnection.iceConnectionState,
+            iceGatheringState: peerConnection.iceGatheringState,
+            signalingState: peerConnection.signalingState,
+          });
+
+          if (
+            peerConnection.connectionState === "connected" ||
+            peerConnection.connectionState === "disconnected" ||
+            peerConnection.connectionState === "failed"
+          ) {
+            void logSelectedCandidatePair(
+              peerConnection,
+              log,
+              `connection:${peerConnection.connectionState}`,
+            );
+          }
+
+          if (peerConnection.connectionState === "connected") {
+            clearDisconnectTimer();
+            isRestartingIceRef.current = false;
+            iceRestartAttemptsRef.current = 0;
+          }
+
+          if (peerConnection.connectionState === "disconnected") {
+            clearDisconnectTimer();
+            disconnectTimerRef.current = window.setTimeout(() => {
+              if (peerConnection?.connectionState === "disconnected") {
+                void restartIce("disconnect timeout");
+              }
+              disconnectTimerRef.current = null;
+            }, 5000);
+          }
+
+          if (peerConnection.connectionState === "failed") {
+            clearDisconnectTimer();
+            void restartIce("connection failed");
+          }
+
+          if (peerConnection.connectionState === "closed") {
+            clearDisconnectTimer();
+          }
+        };
+
+        setPeerConnectionReadyVersion((currentVersion) => currentVersion + 1);
+      } catch (error) {
+        if (isDisposed) {
+          return;
+        }
+
+        log("failed to create peer connection", error);
+        setConnectionState("failed");
       }
     };
+
+    void setupPeerConnection();
 
     return () => {
-      log("disposing peer connection", {
-        connectionState: peerConnection.connectionState,
-        iceConnectionState: peerConnection.iceConnectionState,
-      });
+      isDisposed = true;
       clearDisconnectTimer();
       localStreamRef.current?.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
-      peerConnection.close();
+      if (peerConnection) {
+        log("disposing peer connection", {
+          connectionState: peerConnection.connectionState,
+          iceConnectionState: peerConnection.iceConnectionState,
+        });
+        peerConnection.close();
+      }
+      if (peerConnectionRef.current === peerConnection) {
+        peerConnectionRef.current = null;
+      }
     };
   }, [roomId, sendMessage]);
 
@@ -471,6 +540,11 @@ export function useWebRTC(
           });
 
           if (message.type === "role") {
+            if (!peerConnectionRef.current) {
+              logRef.current("waiting for peer connection before processing role");
+              return;
+            }
+
             const assignedRole = message.data.role;
             const negotiatedMode = resolveCallMode(message.data.mode ?? mode);
             myRoleRef.current = assignedRole;
@@ -611,7 +685,7 @@ export function useWebRTC(
     };
 
     void processMessages();
-  }, [messages, mode, roomId, sendMessage]);
+  }, [messages, mode, roomId, sendMessage, peerConnectionReadyVersion]);
 
   const flushIceQueue = async () => {
     if (pendingCandidatesRef.current.length > 0) {
@@ -638,17 +712,25 @@ export function useWebRTC(
 
   const startCall = async () => {
     try {
+      const peerConnection = peerConnectionRef.current;
+      if (!peerConnection) {
+        logRef.current("offer creation skipped", {
+          reason: "peer connection missing",
+        });
+        return;
+      }
+
       if (myRoleRef.current === "initiator" && !hasCreatedOfferRef.current) {
         logRef.current("creating offer", {
           role: myRoleRef.current,
         });
-        const offer = await peerConnectionRef.current?.createOffer();
-        await peerConnectionRef.current?.setLocalDescription(offer);
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
         updateLocalFingerprint(
-          peerConnectionRef.current?.localDescription?.sdp ?? offer?.sdp,
+          peerConnection.localDescription?.sdp ?? offer.sdp,
         );
         logRef.current("sending offer", {
-          sdpLength: offer?.sdp?.length ?? 0,
+          sdpLength: offer.sdp?.length ?? 0,
         });
         sendMessage({
           type: "signal",
